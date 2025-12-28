@@ -1,0 +1,47 @@
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.env
+env/
+venv/
+.venv/
+
+# Jupyter lab
+**/.ipynb_checkpoints/**
+
+# Test and Coverage
+.tox/
+.pytest_cache/
+.coverage
+nosetests.xml
+coverage.xml
+htmlcov/
+
+# Virtual Environment
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Build / Distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# SQLite and Local DBs
+*.db
+*.sqlite3
+test_db.db
+
+# System/IDE files
+.DS_Store
+.idea/
+.vscode/
+
+# Others
+*.log
