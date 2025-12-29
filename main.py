@@ -1,215 +1,235 @@
-"""
-Connect4 ML API - Inference Microservice
-
-Serves move predictions via REST API.
-Fast, lightweight, stateless inference service.
-"""
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+import logging
 import joblib
 import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict
 from pathlib import Path
-import logging
-import os
-from datetime import datetime
+from src.preprocessing import Connect4Preprocessor
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ML_API")
+
+app = FastAPI(title="Connect4 ML Inference API")
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-logger = logging.getLogger(__name__)
 
-# App
-app = FastAPI(
-    title="Connect4 ML API",
-    description="Policy imitation model for Connect4 move prediction",
-    version="1.0.0"
-)
+# Global State
+MODEL_DIR = Path("/app/models")
+current_model = None
+current_preprocessor = None
+current_version = "v0"
 
-# Models (loaded on startup)
-model = None
-preprocessor = None
-model_version = None
-model_loaded_at = None
 
+# --- Data Models ---
 
 class BoardState(BaseModel):
-    """Board state representation"""
-    board: List[List[int]] = Field(..., description="6x7 board (0=empty, 1=player1, 2=player2)")
-    current_player: int = Field(..., description="Current player (1 or 2)")
-    legal_moves: List[int] = Field(..., description="Legal columns [0-6]")
+    board: List[List[int]]  # 6x7 matrix
+    current_player: int
+    legal_moves: List[int]
 
 
 class PredictionRequest(BaseModel):
-    """Prediction request"""
     board_state: BoardState
-    top_k: Optional[int] = Field(3, description="Number of top moves to return")
+    top_k: Optional[int] = 3
 
 
-class PredictionResponse(BaseModel):
-    """Prediction response"""
-    predicted_move: int
-    confidence: float
-    top_k_moves: List[Dict[str, float]]
-    inference_time_ms: float
-    model_version: str
+class DeployRequest(BaseModel):
+    version: str
 
 
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str
-    model_loaded: bool
-    model_version: Optional[str]
-    model_loaded_at: Optional[str]
-    uptime_seconds: float
+# --- Helper Functions ---
 
+def load_model_artifacts(version: str):
+    """Loads model and preprocessor for a specific version."""
+    global current_model, current_preprocessor, current_version
 
-# Startup
-@app.on_event("startup")
-async def load_model():
-    """Load model and preprocessor on startup"""
-    global model, preprocessor, model_version, model_loaded_at
-    
-    logger.info("Loading model...")
-    
+    model_path = MODEL_DIR / f"model_{version}.joblib"
+    prep_path = MODEL_DIR / f"preprocessor_{version}.joblib"
+
+    if not model_path.exists() or not prep_path.exists():
+        logger.error(f" Model files not found for version {version}")
+        return False
+
     try:
-        # Paths from environment
-        model_path = os.getenv('MODEL_PATH', '/app/models/v1/xgboost/xgboost_model_v1.joblib')
-        preprocessor_path = os.getenv('PREPROCESSOR_PATH', '/app/models/v1/preprocessing/preprocessor.joblib')
-        model_version = os.getenv('MODEL_VERSION', 'v1')
-        
-        # Load
-        model = joblib.load(model_path)
-        preprocessor = joblib.load(preprocessor_path)
-        model_loaded_at = datetime.now()
-        
-        logger.info(f"Model loaded successfully: {model_version}")
-        logger.info(f"Model path: {model_path}")
-        logger.info(f"Preprocessor path: {preprocessor_path}")
-        
+        logger.info(f" Loading version {version}...")
+        current_model = joblib.load(model_path)
+        current_preprocessor = joblib.load(prep_path)
+        current_version = version
+        logger.info(f" Successfully loaded version {version}")
+        return True
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        raise
+        logger.error(f" Failed to load artifacts: {e}")
+        return False
 
 
-def preprocess_board(board_state: BoardState) -> np.ndarray:
+def preprocess_board_for_inference(board: List[List[int]]) -> np.ndarray:
     """
-    Preprocess board state for prediction.
-    
-    Args:
-        board_state: Board state
-        
-    Returns:
-        Feature vector
+    Convert board to scaled features using the preprocessor.
+    This fixes the sklearn warning and ensures proper scaling.
     """
-    # Convert board to numpy array
-    board = np.array(board_state.board, dtype=np.int8)
-    
-    # Extract features (simplified - full preprocessing in actual model)
-    features = []
-    
-    # Flatten board
-    features.extend(board.flatten())
-    
-    # Current player
-    features.append(board_state.current_player)
-    
-    # Legal moves (binary)
-    legal_moves_binary = [1 if i in board_state.legal_moves else 0 for i in range(7)]
-    features.extend(legal_moves_binary)
-    
-    return np.array([features])
+    # Flatten the board to 42 features
+    flat_board = np.array(board).flatten()
+
+    #  Create feature names matching training (board_0, board_1, ..., board_41)
+    feature_names = [f"board_{i}" for i in range(42)]
+
+    #   Create DataFrame with proper feature names
+    # The scaler was fitted on data with these column names during training
+    features_df = pd.DataFrame([flat_board], columns=feature_names)
+
+    scaled_features = features_df.values
+
+    # Log for debugging (remove in production)
+    logger.debug(f" Board (first 10): {flat_board[:10]}")
+    logger.debug(f" Scaled (first 10): {scaled_features[0][:10]}")
+
+    return scaled_features
 
 
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    uptime = (datetime.now() - model_loaded_at).total_seconds() if model_loaded_at else 0
-    
-    return HealthResponse(
-        status="healthy" if model is not None else "unhealthy",
-        model_loaded=model is not None,
-        model_version=model_version,
-        model_loaded_at=model_loaded_at.isoformat() if model_loaded_at else None,
-        uptime_seconds=uptime
-    )
+# --- Endpoints ---
+
+@app.on_event("startup")
+async def startup_event():
+    """Try to load the latest model on startup."""
+    logger.info(" ML API starting up...")
+
+    if not MODEL_DIR.exists():
+        logger.warning(f" Model directory {MODEL_DIR} does not exist.")
+        return
+
+    # Find all model files
+    files = list(MODEL_DIR.glob("model_*.joblib"))
+    if not files:
+        logger.warning(" No models found in /app/models. Waiting for training...")
+        return
+
+    # Sort by version
+    latest_model = sorted(files)[-1]
+    try:
+        version = latest_model.stem.split("_")[-1]  # Extract 'v1' from 'model_v1'
+        logger.info(f" Found latest model: {version}")
+        load_model_artifacts(version)
+    except Exception as e:
+        logger.error(f"Error loading model on startup: {e}")
 
 
-@app.post("/predict", response_model=PredictionResponse)
+@app.post("/deploy")
+async def deploy_model(request: DeployRequest, background_tasks: BackgroundTasks):
+    """
+    Endpoint called by the Training Service to trigger a reload.
+    """
+    version = request.version
+    logger.info(f" Received deployment signal for {version}")
+
+    # Check if files exist
+    if not (MODEL_DIR / f"model_{version}.joblib").exists():
+        raise HTTPException(status_code=404, detail="Model version files not found")
+
+    # Load immediately
+    success = load_model_artifacts(version)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to load model")
+
+    return {"status": "deployed", "version": version}
+
+
+@app.post("/predict")
 async def predict_move(request: PredictionRequest):
     """
-    Predict best move for given board state.
-    
-    Args:
-        request: Prediction request with board state
-        
-    Returns:
-        Predicted move with confidence and top-k alternatives
+    Main inference endpoint.
     """
-    if model is None or preprocessor is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    start_time = datetime.now()
-    
+    if current_model is None:
+        raise HTTPException(status_code=503, detail="No model loaded yet")
+
     try:
-        # Preprocess
-        features = preprocess_board(request.board_state)
-        
-        # Predict probabilities
-        probabilities = model.predict_proba(features)[0]
-        
-        # Filter to legal moves only
-        legal_probs = {
-            move: probabilities[move] 
-            for move in request.board_state.legal_moves
-        }
-        
-        # Sort by probability
-        sorted_moves = sorted(legal_probs.items(), key=lambda x: x[1], reverse=True)
-        
-        # Best move
-        best_move, best_confidence = sorted_moves[0]
-        
-        # Top-k moves
-        top_k_moves = [
-            {"move": int(move), "confidence": float(conf)}
-            for move, conf in sorted_moves[:request.top_k]
-        ]
-        
-        # Inference time
-        inference_time = (datetime.now() - start_time).total_seconds() * 1000
-        
-        return PredictionResponse(
-            predicted_move=int(best_move),
-            confidence=float(best_confidence),
-            top_k_moves=top_k_moves,
-            inference_time_ms=inference_time,
-            model_version=model_version
+        # Use the corrected preprocessing function
+        scaled_features = preprocess_board_for_inference(request.board_state.board)
+
+        # 2. Predict Probabilities
+        probs = current_model.predict_proba(scaled_features)[0]
+
+        # 3. Filter Illegal Moves
+        legal_moves = set(request.board_state.legal_moves)
+        legal_probs = {}
+
+        for col in range(7):
+            if col in legal_moves:
+                legal_probs[col] = float(probs[col])
+
+        if not legal_probs:
+            raise HTTPException(status_code=400, detail="No legal moves available")
+
+        # 4. Select Best Move
+        best_move = max(legal_probs, key=legal_probs.get)
+        confidence = legal_probs[best_move]
+
+        # 5. Top K Moves
+        sorted_moves = sorted(
+            legal_probs.items(),
+            key=lambda x: x[1],
+            reverse=True
         )
-        
+
+        return {
+            "predicted_move": int(best_move),
+            "confidence": confidence,
+            "top_k_moves": [
+                {"move": m, "confidence": c} for m, c in sorted_moves[:request.top_k]
+            ],
+            "model_version": current_version
+        }
+
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Prediction error: {e}")
+        logger.error(f"Prediction Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
+@app.get("/health")
+def health_check():
     return {
-        "service": "Connect4 ML API",
-        "version": "1.0.0",
-        "model_version": model_version,
-        "endpoints": {
-            "health": "/health",
-            "predict": "/predict",
-            "docs": "/docs"
-        }
+        "status": "healthy" if current_model is not None else "waiting",
+        "model_loaded": current_model is not None,
+        "current_version": current_version,
+        "model_dir": str(MODEL_DIR)
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/debug/test-prediction")
+async def debug_test_prediction():
+    """
+    Debug endpoint to test if predictions change with different boards.
+    """
+    if current_model is None:
+        return {"error": "No model loaded"}
+
+    # Test 1: Empty board
+    empty_board = [[0]*7 for _ in range(6)]
+    empty_features = preprocess_board_for_inference(empty_board)
+    empty_probs = current_model.predict_proba(empty_features)[0]
+
+    # Test 2: Board with one piece
+    one_piece_board = [[0]*7 for _ in range(6)]
+    one_piece_board[5][3] = 1
+    one_piece_features = preprocess_board_for_inference(one_piece_board)
+    one_piece_probs = current_model.predict_proba(one_piece_features)[0]
+
+    return {
+        "empty_board_probs": empty_probs.tolist(),
+        "one_piece_board_probs": one_piece_probs.tolist(),
+        "are_different": not np.allclose(empty_probs, one_piece_probs),
+        "message": "Predictions should be DIFFERENT if model is working correctly"
+    }

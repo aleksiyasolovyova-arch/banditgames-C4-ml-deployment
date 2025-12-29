@@ -1,4 +1,4 @@
-# Python
+# --- Standard Python ---
 **/__pycache__/
 *.pyc
 *.pyo
@@ -9,39 +9,22 @@ env/
 venv/
 .venv/
 
-# Jupyter lab
-**/.ipynb_checkpoints/**
+# --- Logs ---
+*.log
 
-# Test and Coverage
-.tox/
-.pytest_cache/
-.coverage
-nosetests.xml
-coverage.xml
-htmlcov/
-
-# Virtual Environment
-env/
-.venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Build / Distribution
-build/
-dist/
-*.egg-info/
-*.egg
-
-# SQLite and Local DBs
-*.db
-*.sqlite3
-test_db.db
-
-# System/IDE files
+# --- System / IDE ---
 .DS_Store
 .idea/
 .vscode/
 
-# Others
-*.log
+# ============================
+#  DEPLOYMENT SPECIFIC
+# ============================
+
+# Ignore actual model files (they are large binaries)
+# But keep the folder so Docker can mount to it
+models/*
+!models/.gitkeep
+
+# Docker overrides (local settings)
+docker-compose.override.yml

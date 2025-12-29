@@ -1,26 +1,21 @@
-FROM python:3.11-slim
-
-LABEL maintainer="your-team@example.com"
-LABEL service="connect4-ml-api"
-LABEL version="1.0.0"
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install minimal dependencies
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy source code
+# We copy src/ so that 'from src.preprocessing' works exactly like in training
+COPY src/ /app/src/
 COPY main.py .
 
-# Model directory (mounted as volume)
+# Create the models directory (Volume mount point)
 RUN mkdir -p /app/models
-VOLUME /app/models
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
-  CMD python -c "import requests; requests.get('http://localhost:8000/health').raise_for_status()"
+# Expose API port
+EXPOSE 8001
 
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the API
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
