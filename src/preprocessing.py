@@ -64,7 +64,9 @@ class Connect4Preprocessor:
                 X.columns = self.feature_columns[:len(X.columns)]
 
             y = None
-            if 'action_taken' in subset_df.columns:
+            if 'actionTaken' in subset_df.columns:  # ← FIX: Use camelCase
+                y = subset_df['actionTaken'].astype(int)
+            elif 'action_taken' in subset_df.columns:  # Fallback for old datasets
                 y = subset_df['action_taken'].astype(int)
             elif 'moveIndex' in subset_df.columns:
                 y = subset_df['moveIndex'].astype(int)
