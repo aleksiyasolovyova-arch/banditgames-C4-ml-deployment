@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import logging
-from typing import Dict
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,65 @@ class Connect4Preprocessor:
             return [char_map.get(c, 0) for c in s]
 
         return pd.DataFrame(series.apply(parse).tolist(), columns=self.feature_columns)
+
+    def winprob_features_from_board(board: List[List[int]]) -> np.ndarray:
+        """
+        Build EXACT win-prob feature vector (65 features)
+        Must match training order exactly.
+        """
+
+        board = np.array(board, dtype=int)
+        flat = board.flatten()  # 42
+
+        # --- Engineered features ---
+        player1_pieces = np.sum(flat == 1)
+        player2_pieces = np.sum(flat == 2)
+
+        center_idxs = []
+        for r in range(6):
+            for c in [2, 3, 4]:
+                center_idxs.append(r * 7 + c)
+
+        center = flat[center_idxs]
+        center_p1 = np.sum(center == 1)
+        center_p2 = np.sum(center == 2)
+
+        move_number = np.count_nonzero(flat)
+
+        # --- Policy & Q-value placeholders ---
+        policy = np.zeros(7, dtype=float)
+        qvalues = np.zeros(7, dtype=float)
+
+        # --- Derived ---
+        probs = policy + 1e-10
+        probs /= probs.sum()
+
+        policy_entropy = -np.sum(probs * np.log(probs))
+        policy_max = probs.max()
+
+        q_mean = qvalues.mean()
+        q_range = qvalues.max() - qvalues.min()
+
+        engineered = np.array([
+            player1_pieces,
+            player2_pieces,
+            center_p1,
+            center_p2,
+            move_number,
+            policy_entropy,
+            policy_max,
+            q_mean,
+            q_range
+        ])
+
+        features = np.concatenate([
+            flat,  # 42
+            policy,  # 7
+            qvalues,  # 7
+            engineered  # 9
+        ])
+
+        return features.reshape(1, -1)
 
     def preprocess_pipeline(self, dataset_path: str) -> Dict[str, np.ndarray]:
         logger.info(f"📥 Loading dataset: {dataset_path}")
@@ -85,3 +144,24 @@ class Connect4Preprocessor:
             "X_test": X_test_scaled, "y_test": y_test,
             "feature_names": self.feature_columns
         }
+
+    def transform_board_state(self, board: list, current_player: int) -> np.ndarray:
+        """
+        Used by deployment service.
+        No dataset columns required.
+        """
+        flat = np.array(board).flatten()
+
+        df = pd.DataFrame([flat], columns=self.feature_columns[:42])
+        df["current_player"] = current_player
+
+        # ensure all features exist
+        for col in self.feature_columns:
+            if col not in df.columns:
+                df[col] = 0
+
+        return self.scaler.transform(df[self.feature_columns])
+
+
+
+

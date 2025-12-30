@@ -26,10 +26,18 @@ app.add_middleware(
 
 # Global State
 MODEL_DIR = Path("/app/models")
-current_model = None
-current_preprocessor = None
-current_version = "v0"
-
+MODELS = {
+    "policy": {
+        "model": None,
+        "preprocessor": None,
+        "version": None,
+    },
+    "winprob": {
+        "model": None,
+        "preprocessor": None,
+        "version": None,
+    }
+}
 
 # --- Data Models ---
 
@@ -51,26 +59,71 @@ class DeployRequest(BaseModel):
 # --- Helper Functions ---
 
 def load_model_artifacts(version: str):
-    """Loads model and preprocessor for a specific version."""
-    global current_model, current_preprocessor, current_version
+    """
+    Loads BOTH policy and win-prob models if they exist.
+    Does NOT fail if one is missing.
+    """
+    loaded_any = False
 
-    model_path = MODEL_DIR / f"model_{version}.joblib"
-    prep_path = MODEL_DIR / f"preprocessor_{version}.joblib"
+    # -------------------------
+    # POLICY MODEL (existing)
+    # -------------------------
+    policy_model_path = MODEL_DIR / f"model_{version}.joblib"
+    policy_prep_path = MODEL_DIR / f"preprocessor_{version}.joblib"
 
-    if not model_path.exists() or not prep_path.exists():
-        logger.error(f" Model files not found for version {version}")
-        return False
+    if policy_model_path.exists() and policy_prep_path.exists():
+        try:
+            MODELS["policy"]["model"] = joblib.load(policy_model_path)
+            MODELS["policy"]["preprocessor"] = joblib.load(policy_prep_path)
+            MODELS["policy"]["version"] = version
+            logger.info(f" Policy model loaded: {version}")
+            loaded_any = True
+        except Exception as e:
+            logger.error(f" Failed to load policy model: {e}")
 
+    # -------------------------
+    # WIN-PROB MODEL (new)
+    # -------------------------
+    win_model_path = MODEL_DIR / f"winprob_model_{version}.joblib"
+    win_prep_path = MODEL_DIR / f"winprob_preprocessor_{version}.joblib"
+
+    if win_model_path.exists() and win_prep_path.exists():
+        try:
+            MODELS["winprob"]["model"] = joblib.load(win_model_path)
+            MODELS["winprob"]["preprocessor"] = joblib.load(win_prep_path)
+            MODELS["winprob"]["version"] = version
+            logger.info(f" WinProb model loaded: {version}")
+            loaded_any = True
+        except Exception as e:
+            logger.error(f" Failed to load win-prob model: {e}")
+
+    return loaded_any
+
+
+def is_winprob_model(model) -> bool:
+    """
+    Win-prob models output 3-class probabilities:
+    [LOSS, DRAW, WIN]
+    """
     try:
-        logger.info(f" Loading version {version}...")
-        current_model = joblib.load(model_path)
-        current_preprocessor = joblib.load(prep_path)
-        current_version = version
-        logger.info(f" Successfully loaded version {version}")
-        return True
-    except Exception as e:
-        logger.error(f" Failed to load artifacts: {e}")
+        n_classes = model.n_classes_
+        return n_classes == 3
+    except AttributeError:
         return False
+
+def align_board_to_player(board: list[list[int]], current_player: int) -> np.ndarray:
+    """
+    Align board so that the model always sees the position
+    from the perspective of Player 1.
+    """
+    board = np.array(board, dtype=int)
+
+    if current_player == 2:
+        # swap 1 <-> 2
+        board = np.where(board == 1, 2, np.where(board == 2, 1, board))
+
+    return board.flatten().reshape(1, -1)
+
 
 
 def preprocess_board_for_inference(board: List[List[int]]) -> np.ndarray:
@@ -126,17 +179,12 @@ async def startup_event():
 
 @app.post("/deploy")
 async def deploy_model(request: DeployRequest, background_tasks: BackgroundTasks):
-    """
-    Endpoint called by the Training Service to trigger a reload.
-    """
     version = request.version
-    logger.info(f" Received deployment signal for {version}")
+    logger.info(f"Received deployment signal for {version}")
 
-    # Check if files exist
     if not (MODEL_DIR / f"model_{version}.joblib").exists():
         raise HTTPException(status_code=404, detail="Model version files not found")
 
-    # Load immediately
     success = load_model_artifacts(version)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to load model")
@@ -144,92 +192,131 @@ async def deploy_model(request: DeployRequest, background_tasks: BackgroundTasks
     return {"status": "deployed", "version": version}
 
 
+
 @app.post("/predict")
 async def predict_move(request: PredictionRequest):
-    """
-    Main inference endpoint.
-    """
-    if current_model is None:
-        raise HTTPException(status_code=503, detail="No model loaded yet")
+    model = MODELS["policy"]["model"]
+
+    if model is None:
+        raise HTTPException(status_code=503, detail="Policy model not loaded")
+
+    scaled_features = preprocess_board_for_inference(
+        request.board_state.board
+    )
+
+    probs = model.predict_proba(scaled_features)[0]
+
+    legal_moves = set(request.board_state.legal_moves)
+    legal_probs = {
+        col: float(probs[col])
+        for col in legal_moves
+    }
+
+    best_move = max(legal_probs, key=legal_probs.get)
+
+    return {
+        "predicted_move": int(best_move),
+        "confidence": legal_probs[best_move],
+        "top_k_moves": [
+            {"move": m, "confidence": c}
+            for m, c in sorted(
+                legal_probs.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:request.top_k]
+        ],
+        "model_version": MODELS["policy"]["version"]
+    }
+
+@app.post("/predict-winprob")
+async def predict_winprob(request: PredictionRequest):
+    model = MODELS["winprob"]["model"]
+
+    if model is None:
+        raise HTTPException(status_code=503, detail="Win-prob model not loaded")
 
     try:
-        # Use the corrected preprocessing function
-        scaled_features = preprocess_board_for_inference(request.board_state.board)
-
-        # 2. Predict Probabilities
-        probs = current_model.predict_proba(scaled_features)[0]
-
-        # 3. Filter Illegal Moves
-        legal_moves = set(request.board_state.legal_moves)
-        legal_probs = {}
-
-        for col in range(7):
-            if col in legal_moves:
-                legal_probs[col] = float(probs[col])
-
-        if not legal_probs:
-            raise HTTPException(status_code=400, detail="No legal moves available")
-
-        # 4. Select Best Move
-        best_move = max(legal_probs, key=legal_probs.get)
-        confidence = legal_probs[best_move]
-
-        # 5. Top K Moves
-        sorted_moves = sorted(
-            legal_probs.items(),
-            key=lambda x: x[1],
-            reverse=True
+        # 1) Align board to side-to-move
+        aligned_board = align_board_to_player(
+            request.board_state.board,
+            request.board_state.current_player
         )
 
+        # 2) Build FULL 65-feature vector
+        X = Connect4Preprocessor.winprob_features_from_board(aligned_board)
+
+        # 3) Predict
+        probs = model.predict_proba(X)[0]
+
+        if len(probs) == 2:
+            loss_p, win_p = probs
+            draw_p = 0.0
+            model_type = "binary"
+        else:
+            loss_p, draw_p, win_p = probs
+            model_type = "multiclass"
+
         return {
-            "predicted_move": int(best_move),
-            "confidence": confidence,
-            "top_k_moves": [
-                {"move": m, "confidence": c} for m, c in sorted_moves[:request.top_k]
-            ],
-            "model_version": current_version
+            "loss": float(loss_p),
+            "draw": float(draw_p),
+            "win": float(win_p),
+            "model_type": model_type,
+            "model_version": MODELS["winprob"]["version"],
         }
 
-    except ValueError as e:
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Prediction Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
 def health_check():
     return {
-        "status": "healthy" if current_model is not None else "waiting",
-        "model_loaded": current_model is not None,
-        "current_version": current_version,
-        "model_dir": str(MODEL_DIR)
+        "policy_loaded": MODELS["policy"]["model"] is not None,
+        "policy_version": MODELS["policy"]["version"],
+        "winprob_loaded": MODELS["winprob"]["model"] is not None,
+        "winprob_version": MODELS["winprob"]["version"],
     }
 
 
+
 @app.get("/debug/test-prediction")
-async def debug_test_prediction():
+async def debug_test_prediction(model_type: str = "policy"):
     """
-    Debug endpoint to test if predictions change with different boards.
+    Debug endpoint to verify model sensitivity to board changes.
+
+    model_type:
+      - "policy"
+      - "winprob"
     """
-    if current_model is None:
-        return {"error": "No model loaded"}
+    if model_type not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail="model_type must be 'policy' or 'winprob'"
+        )
 
-    # Test 1: Empty board
-    empty_board = [[0]*7 for _ in range(6)]
-    empty_features = preprocess_board_for_inference(empty_board)
-    empty_probs = current_model.predict_proba(empty_features)[0]
+    model = MODELS[model_type]["model"]
 
-    # Test 2: Board with one piece
-    one_piece_board = [[0]*7 for _ in range(6)]
+    if model is None:
+        return {"error": f"{model_type} model not loaded"}
+
+    # --- Test boards ---
+    empty_board = [[0] * 7 for _ in range(6)]
+    one_piece_board = [[0] * 7 for _ in range(6)]
     one_piece_board[5][3] = 1
-    one_piece_features = preprocess_board_for_inference(one_piece_board)
-    one_piece_probs = current_model.predict_proba(one_piece_features)[0]
+
+    # --- Feature prep ---
+    X_empty = preprocess_board_for_inference(empty_board)
+    X_one = preprocess_board_for_inference(one_piece_board)
+
+    # --- Predict ---
+    empty_probs = model.predict_proba(X_empty)[0]
+    one_piece_probs = model.predict_proba(X_one)[0]
 
     return {
+        "model_type": model_type,
+        "model_version": MODELS[model_type]["version"],
         "empty_board_probs": empty_probs.tolist(),
         "one_piece_board_probs": one_piece_probs.tolist(),
         "are_different": not np.allclose(empty_probs, one_piece_probs),
-        "message": "Predictions should be DIFFERENT if model is working correctly"
+        "message": "Predictions should be DIFFERENT if the model is working correctly"
     }
